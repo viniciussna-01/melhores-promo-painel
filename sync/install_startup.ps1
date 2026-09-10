@@ -12,7 +12,10 @@ param([switch]$Remove)
 $ErrorActionPreference = "Stop"
 
 $Vbs     = "C:\Users\Vinicius\.claude\whatsapp hydra\melhores-promo-painel\sync\start_sync_hidden.vbs"
-$Startup = [Environment]::GetFolderPath("Startup")
+# NAO usar [Environment]::GetFolderPath("Startup"): num PowerShell "como
+# Administrador" isso vira o Startup do usuario admin (Arklok) e a chave
+# nunca roda no logon do Vinicius. Caminho fixo do Vinicius:
+$Startup = "C:\Users\Vinicius\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
 $Link    = Join-Path $Startup "MelhoresPromoSync.vbs"
 
 if ($Remove) {

@@ -62,6 +62,12 @@ BOT_SESSION_PATH = Path(BOT_SESSION).expanduser() if BOT_SESSION else None
 INTERVAL     = float(os.getenv("SYNC_INTERVAL_SECONDS", "2"))
 STATUS_EVERY = float(os.getenv("STATUS_RECOUNT_SECONDS", "15"))
 COMMAND_POLL = float(os.getenv("COMMAND_POLL_SECONDS", "10"))
+# Timeout de TODA chamada ao Firestore. Sem isto, se a rede pro Google cair
+# (tipico depois de suspender/acordar o PC), a chamada gRPC fica pendurada
+# pra sempre e o loop congela calado. Com timeout, vira excecao -> o ciclo
+# do main() cai no except, faz backoff e tenta de novo; e o supervisor
+# (run_sync_forever.ps1) tambem detecta pelo heartbeat.
+FS_TIMEOUT   = float(os.getenv("FIRESTORE_TIMEOUT_SECONDS", "30"))
 WORKER_SILENCE_MIN = float(os.getenv("WORKER_SILENCE_MINUTES", "12"))
 LOCAL_TZ = timezone(timedelta(hours=-3))  # Brasilia - so para derivar "hoje"
 
@@ -94,6 +100,11 @@ signal.signal(signal.SIGTERM, _stop)
 # --------------------------------------------------------------------------- helpers
 def sha1(*parts) -> str:
     return hashlib.sha1("|".join("" if p is None else str(p) for p in parts).encode("utf-8")).hexdigest()
+
+def _sig(obj) -> str:
+    """Assinatura estavel de um objeto - usada para NAO escrever no Firestore
+    quando o conteudo nao mudou (a cota free e de 20k escritas/dia)."""
+    return hashlib.sha1(json.dumps(obj, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 def headline(msg: str | None) -> str | None:
     if not msg:
@@ -162,12 +173,12 @@ def batch_set(collection: str, rows: list[dict], merge: bool = True) -> None:
         for row in rows[i : i + BATCH_MAX]:
             doc_id = row["id"]
             wb.set(db.collection(collection).document(doc_id), row, merge=merge)
-        wb.commit()
+        wb.commit(timeout=FS_TIMEOUT)
 
 def replace_queue(rows: list[dict]) -> None:
     """queue_items reflete a fila ATUAL: grava a fila e apaga o que saiu."""
     keep = {r["id"] for r in rows}
-    existing = {d.id for d in db.collection("queue_items").stream()}
+    existing = {d.id for d in db.collection("queue_items").stream(timeout=FS_TIMEOUT)}
     wb = db.batch()
     ops = 0
     for row in rows:
@@ -177,11 +188,11 @@ def replace_queue(rows: list[dict]) -> None:
         wb.delete(db.collection("queue_items").document(stale))
         ops += 1
     if ops:
-        wb.commit()
+        wb.commit(timeout=FS_TIMEOUT)
 
 def write_status(fields: dict) -> None:
     fields = {**fields, "synced_at": datetime.now(timezone.utc).isoformat()}
-    db.collection("status").document("singleton").set(fields, merge=True)
+    db.collection("status").document("singleton").set(fields, merge=True, timeout=FS_TIMEOUT)
 
 
 # --------------------------------------------------------------------------- controle (pausa)
@@ -230,6 +241,7 @@ def mirror_control(state: dict) -> None:
             "mirrored_at": datetime.now(timezone.utc).isoformat(),
         },
         merge=True,
+        timeout=FS_TIMEOUT,
     )
 
 
@@ -237,7 +249,7 @@ def _pending_commands():
     col = db.collection("commands")
     q = col.where(filter=FieldFilter("status", "==", "pending")) if _HAS_FIELD_FILTER \
         else col.where("status", "==", "pending")
-    return list(q.limit(50).stream())
+    return list(q.limit(50).stream(timeout=FS_TIMEOUT))
 
 
 def process_commands(state: dict) -> dict:
@@ -279,7 +291,8 @@ def process_commands(state: dict) -> dict:
             print(f"[sync] comando ignorado (tipo/origem invalidos): type={t!r} source={src!r}")
         try:
             snap.reference.update(
-                {"status": "applied", "applied_at": datetime.now(timezone.utc).isoformat()}
+                {"status": "applied", "applied_at": datetime.now(timezone.utc).isoformat()},
+                timeout=FS_TIMEOUT,
             )
         except Exception as exc:
             print(f"[sync] nao consegui marcar comando {snap.id} como applied: {exc}")
@@ -370,7 +383,7 @@ def _config_source_list() -> list[str]:
     except Exception:
         return []
 
-def compute_status() -> dict:
+def compute_status() -> tuple[dict, list[dict]]:
     now = datetime.now(timezone.utc)
     today_local = datetime.now(LOCAL_TZ).date()
 
@@ -445,13 +458,8 @@ def compute_status() -> dict:
             "captured_total": g["n"],
             "last_capture_at": g["last"],
         })
-    if grp_rows:
-        try:
-            batch_set("source_groups", grp_rows)
-        except Exception as exc:
-            print(f"[sync] source_groups: {exc}")
 
-    return {
+    status = {
         "worker_last_seen": worker_last.isoformat() if worker_last else None,
         "worker_state": worker_state,
         "last_capture_at": last_capture,
@@ -464,6 +472,8 @@ def compute_status() -> dict:
         "queue_size": qsize,
         "errors_7d": errors_7d,
     }
+    # Devolve tambem grp_rows - QUEM ESCREVE e o loop, e so quando muda.
+    return status, grp_rows
 
 
 # --------------------------------------------------------------------------- loop
@@ -487,9 +497,17 @@ def main() -> None:
         f"grupos_pausados={control['paused_chat_ids'] or '-'}  (comandos a cada {COMMAND_POLL:.0f}s)"
     )
 
-    last_status = 0.0
     last_cmd = 0.0
+    last_status_push = 0.0
     backoff = INTERVAL
+    # Assinaturas do que ja foi enviado - so escreve no Firestore quando muda
+    # (cota free = 20k escritas/dia; antes isto reescrevia a fila a cada 2s).
+    sig_queue = None
+    sig_status = None
+    sig_groups = None
+    # Mesmo sem mudanca, toca 'synced_at' a cada STATUS_HEARTBEAT s para o
+    # painel continuar marcando "ao vivo" (ele checa synced_at < 90s).
+    STATUS_HEARTBEAT = 60.0
 
     while _running:
         cycle_start = time.monotonic()
@@ -506,13 +524,27 @@ def main() -> None:
             if new_pubs:
                 batch_set("publications", [pub_row(p) for p in new_pubs])
 
+            # Fila: so reconcilia se o conteudo mudou desde o ultimo envio.
             q = read_json_file(QUEUE_FILE)
             if isinstance(q, list):
-                replace_queue([queue_row(it, i) for i, it in enumerate(q)])
+                qrows = [queue_row(it, i) for i, it in enumerate(q)]
+                s = _sig(qrows)
+                if s != sig_queue:
+                    replace_queue(qrows)
+                    sig_queue = s
 
-            if time.monotonic() - last_status >= STATUS_EVERY or new_offers or new_pubs:
-                write_status(compute_status())
-                last_status = time.monotonic()
+            # Status + grupos: escreve so quando muda, ou heartbeat do synced_at.
+            status, grp_rows = compute_status()
+            gs = _sig(grp_rows)
+            if grp_rows and gs != sig_groups:
+                batch_set("source_groups", grp_rows)
+                sig_groups = gs
+            ss = _sig(status)
+            due_hb = (time.monotonic() - last_status_push) >= STATUS_HEARTBEAT
+            if ss != sig_status or new_offers or new_pubs or due_hb:
+                write_status(status)
+                sig_status = ss
+                last_status_push = time.monotonic()
 
             save_state(st)
             if new_offers or new_pubs:
