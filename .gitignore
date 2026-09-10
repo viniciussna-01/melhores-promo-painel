@@ -4,6 +4,8 @@ serviceAccountKey.json
 *serviceAccount*.json
 .sync_state.json
 .sync_state.tmp
+sync/logs/
+sync/*.pid
 node_modules/
 .next/
 .vercel/
