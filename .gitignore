@@ -1,0 +1,10 @@
+.env
+.env.local
+serviceAccountKey.json
+*serviceAccount*.json
+.sync_state.json
+.sync_state.tmp
+node_modules/
+.next/
+.vercel/
+__pycache__/

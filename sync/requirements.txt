@@ -1,0 +1,2 @@
+firebase-admin>=6.5
+python-dotenv>=1.0

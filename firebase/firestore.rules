@@ -1,0 +1,31 @@
+rules_version = '2';
+
+// ===========================================================================
+// Painel Melhores Promo - regras do Firestore
+// ---------------------------------------------------------------------------
+// - O PAINEL so LE, e so quem estiver logado.
+// - NINGUEM escreve pelo cliente (allow write: if false).
+// - Quem escreve e o sync_agent.py, com a Admin SDK (service account),
+//   que IGNORA estas regras. Por isso 'write: if false' e seguro.
+// ===========================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+      // Para travar so no seu e-mail, troque a linha acima por:
+      // return request.auth != null
+      //   && request.auth.token.email == 'viniciussna@gmail.com';
+    }
+
+    match /offers/{id}        { allow read: if signedIn(); allow write: if false; }
+    match /publications/{id}  { allow read: if signedIn(); allow write: if false; }
+    match /queue_items/{id}   { allow read: if signedIn(); allow write: if false; }
+    match /status/{id}        { allow read: if signedIn(); allow write: if false; }
+    match /source_groups/{id} { allow read: if signedIn(); allow write: if false; }
+
+    // Qualquer outra colecao: bloqueada.
+    match /{document=**} { allow read, write: if false; }
+  }
+}
