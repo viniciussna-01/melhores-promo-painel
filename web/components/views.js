@@ -1,6 +1,7 @@
 "use client";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { hm, hms, dm, ago, nfmt, shortId } from "@/lib/format";
+import { sendCommand } from "@/lib/commands";
 
 /* ------------------------------------------------------------------ helpers */
 function tag(s) {
@@ -16,8 +17,106 @@ function firstLine(s) {
   return (s || "").split("\n").find((l) => l.trim())?.trim() || "—";
 }
 
+/* --------------------------------------------------------- controle (pausa) */
+// Limpa o estado "ocupado" quando o sync_agent confirma (novo mirrored_at).
+function useCmdBusy(control) {
+  const [busy, setBusy] = useState(false);
+  const seen = useRef(control?.mirrored_at);
+  useEffect(() => {
+    if (control?.mirrored_at && control.mirrored_at !== seen.current) {
+      seen.current = control.mirrored_at;
+      setBusy(false);
+    }
+  }, [control?.mirrored_at]);
+  return [busy, setBusy];
+}
+
+function Controls({ control }) {
+  const pausedAll = !!control?.paused_all;
+  const perGroup = (control?.paused_chat_ids || []).length;
+  const [busy, setBusy] = useCmdBusy(control);
+  const [note, setNote] = useState("");
+
+  async function toggle() {
+    if (
+      !pausedAll &&
+      !window.confirm(
+        "Pausar a captura de TODOS os grupos?\n\n" +
+          "O bot continua no ar — ele só para de capturar novas ofertas. " +
+          "O que já está na fila termina de sair."
+      )
+    )
+      return;
+    setBusy(true);
+    setNote("enviando comando…");
+    try {
+      await sendCommand(pausedAll ? "resume_all" : "pause_all");
+      setNote("comando enviado · aplica em ~10 s");
+    } catch {
+      setBusy(false);
+      setNote("falhou — sem permissão de escrita ou sem conexão");
+    }
+  }
+
+  return (
+    <div className="section">
+      <p className="eyebrow">Controle</p>
+      <div className={"ctrl" + (pausedAll ? " paused" : "")}>
+        <div className="ctrl-info">
+          <span className="ctrl-state">{pausedAll ? "Captura pausada" : "Captura ativa"}</span>
+          <span className="ctrl-meta">
+            {pausedAll
+              ? control?.updated_at
+                ? "desde " + hm(control.updated_at)
+                : "todos os grupos parados"
+              : perGroup > 0
+              ? `${perGroup} grupo(s) pausado(s) individualmente`
+              : "todos os grupos capturando"}
+          </span>
+        </div>
+        <button
+          className={"switchbtn " + (pausedAll ? "resume" : "pause")}
+          onClick={toggle}
+          disabled={busy}
+        >
+          {busy ? "…" : pausedAll ? "Retomar tudo" : "Pausar tudo"}
+        </button>
+      </div>
+      {note && <p className="ctrl-note">{note}</p>}
+      <p className="note">
+        Pausar aqui <b>não desliga o bot</b> — ele fica no ar e volta a capturar ao retomar.
+        O comando chega ao bot em ~10 s (via sync).
+      </p>
+    </div>
+  );
+}
+
+export function GrpToggle({ gid, isPaused, blocked, control }) {
+  const [busy, setBusy] = useCmdBusy(control);
+  async function click() {
+    setBusy(true);
+    try {
+      await sendCommand(isPaused ? "resume_source" : "pause_source", gid);
+    } catch {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="grp-ctrl">
+      <button
+        className={"switchbtn sm " + (isPaused ? "resume" : "pause")}
+        onClick={click}
+        disabled={busy || blocked}
+      >
+        {busy ? "…" : isPaused ? "Retomar" : "Pausar"}
+      </button>
+      {blocked && <span className="grp-ctrl-note">pausa global ativa</span>}
+    </div>
+  );
+}
+
 /* ------------------------------------------------------------------ Status */
-export function StatusView({ status, offers, publications, queue }) {
+export function StatusView({ status, offers, publications, queue, control }) {
   const s = status || {};
   const wk = s.worker_state === "ok"
     ? { cls: "ok", label: "no ar" }
@@ -61,6 +160,8 @@ export function StatusView({ status, offers, publications, queue }) {
         </div>
       </div>
 
+      <Controls control={control} />
+
       <div className="section">
         <p className="eyebrow">Hoje</p>
         <div className="tiles">
@@ -93,27 +194,35 @@ export function StatusView({ status, offers, publications, queue }) {
 }
 
 /* ------------------------------------------------------------------ Grupos */
-export function GruposView({ groups }) {
+export function GruposView({ groups, control }) {
+  const pausedAll = !!control?.paused_all;
+  const pausedIds = new Set((control?.paused_chat_ids || []).map(String));
   return (
     <>
       <p className="eyebrow">Grupos de origem</p>
       <div className="banner">
         <span className="ic">!</span>
-        <span>Os canais aparecem pelo ID numérico — o vínculo com os nomes do <span className="mono">config/sources.json</span> não resolve em execução (bug conhecido do bot).</span>
+        <span>Os canais aparecem pelo ID numérico — o vínculo com os nomes do <span className="mono">config/sources.json</span> não resolve em execução (bug conhecido do bot). A pausa usa o ID, então funciona mesmo assim.</span>
       </div>
       {groups.length === 0 && <p className="center">Carregando grupos…</p>}
-      {groups.map((g) => (
-        <div className="grp" key={g.id}>
-          <div className="id mono">{g.chat_id}</div>
-          <div className="cfg">{g.config_name ? "config: " + g.config_name : "sem nome no config"}</div>
-          <div className="row">
-            <span>Status <b>{g.active ? "Ativo" : "Pausado"}</b></span>
-            <span>Capturadas <b className="mono">{nfmt(g.captured_total)}</b></span>
-            <span>Última <b>{hm(g.last_capture_at)}</b></span>
+      {groups.map((g) => {
+        const gid = String(g.chat_id);
+        const indiv = pausedIds.has(gid);
+        const paused = pausedAll || indiv;
+        return (
+          <div className={"grp" + (paused ? " paused" : "")} key={g.id}>
+            <div className="id mono">{g.chat_id}</div>
+            <div className="cfg">{g.config_name ? "config: " + g.config_name : "sem nome no config"}</div>
+            <div className="row">
+              <span>Status <b>{pausedAll ? "Pausado (global)" : indiv ? "Pausado" : "Ativo"}</b></span>
+              <span>Capturadas <b className="mono">{nfmt(g.captured_total)}</b></span>
+              <span>Última <b>{hm(g.last_capture_at)}</b></span>
+            </div>
+            <GrpToggle gid={gid} isPaused={indiv} blocked={pausedAll} control={control} />
           </div>
-        </div>
-      ))}
-      <p className="note">Contagem total por grupo desde o início do histórico. Pausar grupo pelo painel só na fase de comandos.</p>
+        );
+      })}
+      <p className="note">Contagem total por grupo desde o início do histórico. Pausar um grupo faz o bot ignorar as mensagens dele em ~10 s — sem reiniciar nada.</p>
     </>
   );
 }

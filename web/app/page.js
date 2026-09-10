@@ -4,6 +4,7 @@ import { onAuthStateChanged, signOut } from "firebase/auth";
 import { collection, doc, query, orderBy, limit } from "firebase/firestore";
 import { auth, db } from "@/lib/firebase";
 import { useCollection, useDoc } from "@/lib/useFirestore";
+import { useControl } from "@/lib/commands";
 import { ago } from "@/lib/format";
 import Login from "@/components/Login";
 import { IconStatus, IconGrupos, IconFila, IconHistorico, IconDiag } from "@/components/icons";
@@ -44,6 +45,7 @@ function Panel({ tab, setTab, sel, setSel }) {
   const { data: groups } = useCollection(
     () => query(collection(db, "source_groups"), orderBy("captured_total", "desc")), []
   );
+  const { data: control } = useControl();
 
   const fresh = useMemo(() => {
     if (!status?.synced_at) return false;
@@ -58,7 +60,7 @@ function Panel({ tab, setTab, sel, setSel }) {
         <div className="mark">MP</div>
         <div>
           <h1>Melhores Promo</h1>
-          <div className="sub">Painel · somente leitura</div>
+          <div className="sub">Painel · monitorar e pausar</div>
         </div>
         <span className={"live" + (fresh ? "" : " stale")}>
           <span className="b" />
@@ -67,9 +69,16 @@ function Panel({ tab, setTab, sel, setSel }) {
         <button className="logout" onClick={() => signOut(auth)}>sair</button>
       </header>
 
+      {control?.paused_all && (
+        <div className="pausebar" role="status">
+          <span className="pb-dot" />
+          Captura PAUSADA em todos os grupos — o bot está no ar, só não capta novas ofertas.
+        </div>
+      )}
+
       <main>
-        {tab === "status" && <StatusView status={status} offers={offers} publications={publications} queue={queue} />}
-        {tab === "grupos" && <GruposView groups={groups} />}
+        {tab === "status" && <StatusView status={status} offers={offers} publications={publications} queue={queue} control={control} />}
+        {tab === "grupos" && <GruposView groups={groups} control={control} />}
         {tab === "fila" && <FilaView queue={queue} onOpen={setSel} />}
         {tab === "hist" && <HistoricoView publications={publications} onOpen={setSel} />}
         {tab === "diag" && <DiagView status={status} publications={publications} />}

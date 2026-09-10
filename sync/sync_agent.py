@@ -42,6 +42,12 @@ try:
 except ImportError:
     sys.exit("[sync] falta 'firebase-admin'. Rode: pip install -r requirements.txt")
 
+try:  # filtro moderno; cai no .where posicional se a versao for antiga
+    from google.cloud.firestore_v1 import FieldFilter
+    _HAS_FIELD_FILTER = True
+except Exception:  # pragma: no cover
+    _HAS_FIELD_FILTER = False
+
 # --------------------------------------------------------------------------- config
 def _need(name: str) -> str:
     v = os.getenv(name)
@@ -55,6 +61,7 @@ BOT_SESSION  = os.getenv("BOT_SESSION_FILE", "").strip()
 BOT_SESSION_PATH = Path(BOT_SESSION).expanduser() if BOT_SESSION else None
 INTERVAL     = float(os.getenv("SYNC_INTERVAL_SECONDS", "2"))
 STATUS_EVERY = float(os.getenv("STATUS_RECOUNT_SECONDS", "15"))
+COMMAND_POLL = float(os.getenv("COMMAND_POLL_SECONDS", "10"))
 WORKER_SILENCE_MIN = float(os.getenv("WORKER_SILENCE_MINUTES", "12"))
 LOCAL_TZ = timezone(timedelta(hours=-3))  # Brasilia - so para derivar "hoje"
 
@@ -62,6 +69,10 @@ OFFERS_FILE = BOT_DATA_DIR / "detected_offers.jsonl"
 PUBS_FILE   = BOT_DATA_DIR / "publications.jsonl"
 QUEUE_FILE  = BOT_DATA_DIR / "publish_queue.json"
 SOURCES_CONFIG = BOT_DATA_DIR.parent / "config" / "sources.json"
+# UNICA escrita deste agente dentro da pasta do bot. O worker so LE este
+# arquivo (services/control_state.py) e e fail-open -> nunca ve algo pela
+# metade (gravacao atomica via os.replace). Nada mais do bot e tocado.
+CONTROL_FILE = BOT_DATA_DIR / "control.json"
 STATE_FILE  = Path(__file__).with_name(".sync_state.json")
 
 BATCH_MAX = 450  # limite do Firestore e 500 ops/batch; folga de seguranca
@@ -171,6 +182,120 @@ def replace_queue(rows: list[dict]) -> None:
 def write_status(fields: dict) -> None:
     fields = {**fields, "synced_at": datetime.now(timezone.utc).isoformat()}
     db.collection("status").document("singleton").set(fields, merge=True)
+
+
+# --------------------------------------------------------------------------- controle (pausa)
+# Fluxo: painel cria docs em `commands` (status="pending") -> este agente
+# aplica em `data/control.json` (que o worker le) e marca "applied" ->
+# espelha o estado em `control/state` para o painel refletir a verdade.
+_EMPTY_CONTROL = {"paused_all": False, "paused_chat_ids": [], "updated_at": None}
+
+
+def read_control_file() -> dict:
+    """Le data/control.json (se ja existir de uma execucao anterior)."""
+    try:
+        data = json.loads(CONTROL_FILE.read_text(encoding="utf-8"))
+        return {
+            "paused_all": bool(data.get("paused_all", False)),
+            "paused_chat_ids": [str(x) for x in (data.get("paused_chat_ids") or [])],
+            "updated_at": data.get("updated_at"),
+        }
+    except Exception:
+        return dict(_EMPTY_CONTROL)
+
+
+def write_control_file(state: dict) -> None:
+    """Grava data/control.json de forma ATOMICA (tmp + os.replace).
+
+    Esta e a unica coisa que este agente escreve dentro da pasta do bot.
+    O arquivo so e LIDO pelo worker (fail-open), nunca travado.
+    """
+    payload = {
+        "paused_all": bool(state.get("paused_all", False)),
+        "paused_chat_ids": [str(x) for x in state.get("paused_chat_ids", [])],
+        "updated_at": state.get("updated_at") or datetime.now(timezone.utc).isoformat(),
+    }
+    CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONTROL_FILE.with_name(CONTROL_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, CONTROL_FILE)
+
+
+def mirror_control(state: dict) -> None:
+    db.collection("control").document("state").set(
+        {
+            "paused_all": bool(state.get("paused_all", False)),
+            "paused_chat_ids": [str(x) for x in state.get("paused_chat_ids", [])],
+            "updated_at": state.get("updated_at"),
+            "mirrored_at": datetime.now(timezone.utc).isoformat(),
+        },
+        merge=True,
+    )
+
+
+def _pending_commands():
+    col = db.collection("commands")
+    q = col.where(filter=FieldFilter("status", "==", "pending")) if _HAS_FIELD_FILTER \
+        else col.where("status", "==", "pending")
+    return list(q.limit(50).stream())
+
+
+def process_commands(state: dict) -> dict:
+    """Aplica os comandos pendentes do painel. Nunca levanta excecao para
+    fora (o loop principal ja tem backoff, mas comando e best-effort)."""
+    try:
+        snaps = _pending_commands()
+    except Exception as exc:
+        print(f"[sync] leitura de commands falhou ({type(exc).__name__}: {exc}) - tento no proximo ciclo")
+        return state
+    if not snaps:
+        return state
+
+    items = []
+    for s in snaps:
+        d = s.to_dict() or {}
+        items.append((s, d))
+    items.sort(key=lambda it: str(it[1].get("created_at") or ""))
+
+    changed = False
+    for snap, c in items:
+        t = c.get("type")
+        src = str(c.get("source")).strip() if c.get("source") is not None else None
+        if t == "pause_all":
+            changed |= not state["paused_all"]
+            state["paused_all"] = True
+        elif t == "resume_all":
+            changed |= state["paused_all"]
+            state["paused_all"] = False
+        elif t == "pause_source" and src:
+            if src not in state["paused_chat_ids"]:
+                state["paused_chat_ids"].append(src)
+                changed = True
+        elif t == "resume_source" and src:
+            if src in state["paused_chat_ids"]:
+                state["paused_chat_ids"].remove(src)
+                changed = True
+        else:
+            print(f"[sync] comando ignorado (tipo/origem invalidos): type={t!r} source={src!r}")
+        try:
+            snap.reference.update(
+                {"status": "applied", "applied_at": datetime.now(timezone.utc).isoformat()}
+            )
+        except Exception as exc:
+            print(f"[sync] nao consegui marcar comando {snap.id} como applied: {exc}")
+
+    if changed:
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            write_control_file(state)
+        except Exception as exc:
+            print(f"[sync] FALHA ao gravar control.json ({exc}) - o bot segue no estado anterior")
+        mirror_control(state)
+        print(
+            f"[sync] controle atualizado -> pausa_global={state['paused_all']} "
+            f"grupos_pausados={state['paused_chat_ids'] or '-'}"
+        )
+    return state
 
 
 # --------------------------------------------------------------------------- mapeadores
@@ -352,12 +477,27 @@ def main() -> None:
     if first_run:
         print("[sync] primeira execucao - carga inicial (backfill) de todo o historico...")
 
+    control = read_control_file()
+    try:
+        mirror_control(control)
+    except Exception as exc:
+        print(f"[sync] mirror_control inicial falhou ({exc}) - segue mesmo assim")
+    print(
+        f"[sync] controle: pausa_global={control['paused_all']} "
+        f"grupos_pausados={control['paused_chat_ids'] or '-'}  (comandos a cada {COMMAND_POLL:.0f}s)"
+    )
+
     last_status = 0.0
+    last_cmd = 0.0
     backoff = INTERVAL
 
     while _running:
         cycle_start = time.monotonic()
         try:
+            if time.monotonic() - last_cmd >= COMMAND_POLL:
+                control = process_commands(control)
+                last_cmd = time.monotonic()
+
             new_offers, st["offers_pos"] = read_new_lines(OFFERS_FILE, st.get("offers_pos", 0))
             if new_offers:
                 batch_set("offers", [offer_row(o) for o in new_offers])

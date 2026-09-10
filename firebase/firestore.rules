@@ -25,6 +25,22 @@ service cloud.firestore {
     match /status/{id}        { allow read: if signedIn(); allow write: if false; }
     match /source_groups/{id} { allow read: if signedIn(); allow write: if false; }
 
+    // Estado de controle (pausa) — espelho escrito SO pelo sync_agent (Admin
+    // SDK). O painel apenas le para mostrar o estado real dos botoes.
+    match /control/{id}       { allow read: if signedIn(); allow write: if false; }
+
+    // Comandos do painel (pausar/retomar). O usuario logado so pode CRIAR um
+    // comando "pending" bem-formado; quem fecha (status="applied") e o
+    // sync_agent via Admin SDK. Sem update/delete pelo cliente.
+    match /commands/{id} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.status == 'pending'
+        && request.resource.data.type in ['pause_all', 'resume_all', 'pause_source', 'resume_source']
+        && request.resource.data.keys().hasOnly(['type', 'source', 'status', 'created_at', 'created_by']);
+      allow update, delete: if false;
+    }
+
     // Qualquer outra colecao: bloqueada.
     match /{document=**} { allow read, write: if false; }
   }

@@ -57,6 +57,38 @@ Reescrita a cada ciclo (some quando a oferta é publicada).
 `chat_id`, `config_name` (nome esperado do `config/sources.json`, por ordem),
 `captured_total`, `last_capture_at`, `active`
 
+## `control/state` — estado de pausa (1 documento só)
+
+Espelho de `data/control.json` do bot, escrito **só pelo sync_agent** (Admin SDK).
+O painel apenas lê para os botões refletirem o estado real.
+
+| campo | tipo | significado |
+|---|---|---|
+| `paused_all` | bool | captura pausada em todos os grupos |
+| `paused_chat_ids` | string[] | `chat_id`s de grupos pausados individualmente |
+| `updated_at` | string ISO | quando o estado mudou (último comando aplicado) |
+| `mirrored_at` | string ISO | quando o sync_agent espelhou (o painel usa para saber que o comando foi aplicado) |
+
+## `commands/{autoId}` — comandos do painel → bot
+
+Criados pelo painel (usuário logado), fechados pelo sync_agent.
+
+| campo | tipo | |
+|---|---|---|
+| `type` | string | `pause_all` \| `resume_all` \| `pause_source` \| `resume_source` |
+| `source` | string \| null | `chat_id` do grupo (só para `*_source`) |
+| `status` | string | `pending` → `applied` |
+| `created_at` | timestamp | `serverTimestamp()` |
+| `created_by` | string | e-mail do usuário |
+| `applied_at` | string ISO | quando o sync_agent aplicou |
+
+Fluxo: painel cria `pending` → sync_agent (a cada ~10 s) lê, atualiza `data/control.json`
+(gravação atômica), marca `applied` e espelha `control/state`. O `worker.py` lê
+`data/control.json` no início de cada mensagem (`services/control_state.py`, fail-open).
+
+As regras (`firestore.rules`) deixam o cliente **só criar** um `commands` bem-formado;
+`update`/`delete` e a escrita de `control/` são exclusivas do Admin SDK.
+
 ---
 
 ## Limites do plano free (Spark) — o que respeitar no painel
@@ -66,3 +98,6 @@ Reescrita a cada ciclo (some quando a oferta é publicada).
   3,5k leituras num attach só).
 - **20k escritas/dia.** Backfill inicial ≈ 6k (uma vez). Regime normal ≈ 1–2k/dia.
 - Storage 1 GiB — folgadíssimo.
+- **Comandos:** o sync_agent lê `commands` (query `status==pending`) a cada
+  `COMMAND_POLL_SECONDS` (10 s) ≈ 8,6k leituras/dia. Escritas de `control`/`commands`
+  só quando você clica num botão. Tudo dentro do free tier.
